@@ -1,76 +1,71 @@
-EC2 Automated Patching using AWS Step Functions & EventBridge
+# EC2 Automated Patching using AWS Step Functions & EventBridge
 
-This project automates EC2 patching using AWS Lambda, Step Functions, EventBridge, and SSM, with snapshot backup and automatic rollback.
+This project automates EC2 patching using **AWS Lambda**, **Step Functions**, **EventBridge**, and **SSM**, with snapshot backup and automatic rollback.
 
-The solution is deployed using two CloudFormation stacks:
+The solution is deployed using **two CloudFormation stacks**:
+1. **Lambda stack** – contains all Python patching logic  
+2. **Orchestration stack** – Step Functions + EventBridge scheduler
 
-Lambda stack – contains all Python patching logic
+---
 
-Orchestration stack – Step Functions + EventBridge scheduler
-
-Architecture Summary
+## Architecture Summary
 
 For each EC2 instance:
+1. Take EBS snapshot backup  
+2. Wait until snapshot is completed  
+3. Run SSM patching  
+4. Check patch status  
+5. Reboot if required  
+6. Roll back from snapshot if patching fails  
 
-Take EBS snapshot backup
+Each instance runs **independently and in parallel**.
 
-Wait until snapshot is completed
+---
 
-Run SSM patching
+## Prerequisites
 
-Check patch status
+- AWS account access
+- EC2 instances must:
+  - Have **SSM Agent installed**
+  - Have IAM role with `AmazonSSMManagedInstanceCore`
+- AWS CLI access (AWS **CloudShell recommended**)
 
-Reboot if required
+---
 
-Roll back from snapshot if patching fails
-
-Each instance runs independently and in parallel.
-
-Prerequisites
-
-AWS account access
-
-EC2 instances must:
-
-Have SSM Agent installed
-
-Have IAM role with AmazonSSMManagedInstanceCore
-
-AWS CLI access (AWS CloudShell recommended)
-
-Deployment Order (Important)
+## Deployment Order (Important)
 
 Always deploy stacks in this order:
 
-Lambda stack
+1. **Lambda stack**
+2. **Step Functions + EventBridge stack**
 
-Step Functions + EventBridge stack
+---
 
-1️⃣ Deploy Lambda Stack
+## 1. Deploy Lambda Stack
 
 This stack creates all Lambda functions used for patching.
 
+```bash
 aws cloudformation deploy \
   --stack-name ec2-patching-lambdas \
   --template-file patching-lambdas.yaml \
   --capabilities CAPABILITY_NAMED_IAM
+```
 
-Result
+### Result
+- 6 Lambda functions created
+- Copy the Lambda ARNs for the next step
 
-6 Lambda functions created
+---
 
-Copy the Lambda ARNs for the next step
-
-2️⃣ Deploy Step Functions + EventBridge Stack
+## 2. Deploy Step Functions + EventBridge Stack
 
 This stack:
+- Creates Step Functions state machine
+- Creates EventBridge schedule
+- Connects Lambdas to the workflow
 
-Creates Step Functions state machine
-
-Creates EventBridge schedule
-
-Connects Lambdas to the workflow
-
+```bash
 aws cloudformation deploy \
   --stack-name ec2-patch-automation \
   --template-file patch-automation.yaml \
@@ -84,58 +79,62 @@ aws cloudformation deploy \
     CheckPatchStatusLambdaArn="arn:aws:lambda:ap-south-1:XXXX:function:CheckPatchStatusLambda" \
     RebootInstanceLambdaArn="arn:aws:lambda:ap-south-1:XXXX:function:RebootInstanceLambda" \
     RollbackInstanceLambdaArn="arn:aws:lambda:ap-south-1:XXXX:function:RollbackInstanceLambda"
+```
 
-Parameters Explained
+### Parameters Explained
 
-ScheduleExpression
+- **ScheduleExpression**  
+  Example: `cron(0 20 ? * SUN *)` (weekly, UTC)
 
-Example: cron(0 20 ? * SUN *) (weekly, UTC)
+- **InstanceIds**  
+  Comma-separated EC2 instance IDs
 
-InstanceIds
+- **Lambda ARNs**  
+  Copied from Lambda stack output
 
-Comma-separated EC2 instance IDs
+---
 
-Lambda ARNs
-
-Copied from Lambda stack output
-
-Tags
+## Tags
 
 All supported resources are tagged with:
 
+```
 Usage = Automate patch
+```
 
-Verification
+---
+
+## Verification
 
 After deployment, verify:
 
-CloudFormation
+- **CloudFormation**  
+  Both stacks show `CREATE_COMPLETE`
 
-Both stacks show CREATE_COMPLETE
+- **Lambda**  
+  6 functions exist
 
-Lambda
+- **Step Functions**  
+  State machine visible with Map state
 
-6 functions exist
+- **EventBridge**  
+  Rule is enabled
 
-Step Functions
+---
 
-State machine visible with Map state
-
-EventBridge
-
-Rule is enabled
-
-Cleanup
+## Cleanup
 
 Delete stacks in reverse order:
 
+```bash
 aws cloudformation delete-stack --stack-name ec2-patch-automation
 aws cloudformation delete-stack --stack-name ec2-patching-lambdas
+```
 
-Notes
+---
 
-Always test on non-production instances first
+## Notes
 
-Start with a small number of instances
-
-Validate rollback at least once before production use
+- Always test on non-production instances first
+- Start with a small number of instances
+- Validate rollback at least once before production use

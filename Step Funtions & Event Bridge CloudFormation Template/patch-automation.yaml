@@ -1,0 +1,241 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Reusable CloudFormation template for EC2 patch automation
+  using Step Functions (Map state) and EventBridge Scheduler
+
+#################################
+# PARAMETERS
+#################################
+Parameters:
+
+  StateMachineName:
+    Type: String
+    Default: automate-patching
+    Description: Name of the Step Functions state machine
+
+  ScheduleExpression:
+    Type: String
+    Description: EventBridge schedule expression (cron or rate)
+
+  InstanceIds:
+    Type: CommaDelimitedList
+    Description: EC2 Instance IDs to patch
+
+  TakeSnapshotLambdaArn:
+    Type: String
+  CheckSnapshotStatusLambdaArn:
+    Type: String
+  StartPatchingLambdaArn:
+    Type: String
+  CheckPatchStatusLambdaArn:
+    Type: String
+  RebootInstanceLambdaArn:
+    Type: String
+  RollbackInstanceLambdaArn:
+    Type: String
+
+#################################
+# IAM ROLE FOR STEP FUNCTIONS
+#################################
+Resources:
+
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+
+  StepFunctionsPolicy:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      RoleName: !Ref StepFunctionsRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - lambda:InvokeFunction
+            Resource:
+              - !Sub "${TakeSnapshotLambdaArn}:*"
+              - !Sub "${CheckSnapshotStatusLambdaArn}:*"
+              - !Sub "${StartPatchingLambdaArn}:*"
+              - !Sub "${CheckPatchStatusLambdaArn}:*"
+              - !Sub "${RebootInstanceLambdaArn}:*"
+              - !Sub "${RollbackInstanceLambdaArn}:*"
+
+#################################
+# STEP FUNCTIONS STATE MACHINE
+#################################
+  PatchStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Ref StateMachineName
+      RoleArn: !GetAtt StepFunctionsRole.Arn
+      StateMachineType: STANDARD
+      DefinitionString: !Sub |
+        {
+          "Comment": "EC2 Patch Automation (Parallel)",
+          "StartAt": "PatchInstances",
+          "States": {
+            "PatchInstances": {
+              "Type": "Map",
+              "ItemsPath": "$.InstanceIds",
+              "MaxConcurrency": 5,
+              "Parameters": {
+                "InstanceId.$": "$$.Map.Item.Value"
+              },
+              "Iterator": {
+                "StartAt": "TakeSnapshot",
+                "States": {
+                  "TakeSnapshot": {
+                    "Type": "Task",
+                    "Resource": "${TakeSnapshotLambdaArn}",
+                    "ResultPath": "$.SnapshotResult",
+                    "Next": "WaitForSnapshot"
+                  },
+                  "WaitForSnapshot": {
+                    "Type": "Wait",
+                    "Seconds": 60,
+                    "Next": "CheckSnapshotStatus"
+                  },
+                  "CheckSnapshotStatus": {
+                    "Type": "Task",
+                    "Resource": "${CheckSnapshotStatusLambdaArn}",
+                    "ResultPath": "$.SnapshotStatus",
+                    "Next": "SnapshotCompleted?"
+                  },
+                  "SnapshotCompleted?": {
+                    "Type": "Choice",
+                    "Choices": [
+                      {
+                        "Variable": "$.SnapshotStatus.status",
+                        "StringEquals": "COMPLETED",
+                        "Next": "StartPatching"
+                      }
+                    ],
+                    "Default": "WaitForSnapshot"
+                  },
+                  "StartPatching": {
+                    "Type": "Task",
+                    "Resource": "${StartPatchingLambdaArn}",
+                    "ResultPath": "$.PatchCommand",
+                    "Next": "WaitForPatch"
+                  },
+                  "WaitForPatch": {
+                    "Type": "Wait",
+                    "Seconds": 120,
+                    "Next": "CheckPatchStatus"
+                  },
+                  "CheckPatchStatus": {
+                    "Type": "Task",
+                    "Resource": "${CheckPatchStatusLambdaArn}",
+                    "ResultPath": "$.PatchStatus",
+                    "Next": "PatchSucceeded?"
+                  },
+                  "PatchSucceeded?": {
+                    "Type": "Choice",
+                    "Choices": [
+                      {
+                        "Variable": "$.PatchStatus.status",
+                        "StringEquals": "SUCCESS",
+                        "Next": "RebootRequired?"
+                      },
+                      {
+                        "Variable": "$.PatchStatus.status",
+                        "StringEquals": "FAILED",
+                        "Next": "RollbackInstance"
+                      }
+                    ],
+                    "Default": "WaitForPatch"
+                  },
+                  "RebootRequired?": {
+                    "Type": "Choice",
+                    "Choices": [
+                      {
+                        "Variable": "$.PatchStatus.rebootRequired",
+                        "BooleanEquals": true,
+                        "Next": "RebootInstance"
+                      }
+                    ],
+                    "Default": "Success"
+                  },
+                  "RebootInstance": {
+                    "Type": "Task",
+                    "Resource": "${RebootInstanceLambdaArn}",
+                    "Next": "Success"
+                  },
+                  "RollbackInstance": {
+                    "Type": "Task",
+                    "Resource": "${RollbackInstanceLambdaArn}",
+                    "Next": "Failure"
+                  },
+                  "Success": {
+                    "Type": "Succeed"
+                  },
+                  "Failure": {
+                    "Type": "Fail",
+                    "Error": "PatchingFailed",
+                    "Cause": "Patch failed and rollback executed"
+                  }
+                }
+              },
+              "End": true
+            }
+          }
+        }
+
+#################################
+# EVENTBRIDGE ROLE
+#################################
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+
+  EventBridgePolicy:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      RoleName: !Ref EventBridgeRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - states:StartExecution
+            Resource: !Ref PatchStateMachine
+
+#################################
+# EVENTBRIDGE SCHEDULE RULE
+#################################
+  PatchSchedulerRule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !Ref PatchStateMachine
+          Id: PatchStateMachineTarget
+          RoleArn: !GetAtt EventBridgeRole.Arn
+          Input: !Sub |
+            {
+              "InstanceIds": ${InstanceIds}
+            }
+
+#################################
+# OUTPUTS
+#################################
+Outputs:
+  StateMachineArn:
+    Value: !Ref PatchStateMachine
+    Description: Step Functions State Machine ARN

@@ -1,0 +1,110 @@
+{
+  "Comment": "EC2 Snapshot, Patch, Reboot and Rollback Automation (Parallel)",
+  "StartAt": "PatchInstances",
+  "States": {
+    "PatchInstances": {
+      "Type": "Map",
+      "ItemsPath": "$.InstanceIds",
+      "MaxConcurrency": 5,
+      "Parameters": {
+        "InstanceId.$": "$$.Map.Item.Value"
+      },
+      "Iterator": {
+        "StartAt": "TakeSnapshot",
+        "States": {
+          "TakeSnapshot": {
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:ap-south-1:757443077630:function:TakeSnapshotLambda",
+            "ResultPath": "$.SnapshotResult",
+            "Next": "WaitForSnapshot"
+          },
+          "WaitForSnapshot": {
+            "Type": "Wait",
+            "Seconds": 60,
+            "Next": "CheckSnapshotStatus"
+          },
+          "CheckSnapshotStatus": {
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:ap-south-1:757443077630:function:CheckSnapshotStatusLambda",
+            "ResultPath": "$.SnapshotStatus",
+            "Next": "SnapshotCompleted?"
+          },
+          "SnapshotCompleted?": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.SnapshotStatus.status",
+                "StringEquals": "COMPLETED",
+                "Next": "StartPatching"
+              }
+            ],
+            "Default": "WaitForSnapshot"
+          },
+          "StartPatching": {
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:ap-south-1:757443077630:function:StartPatchingLambda",
+            "ResultPath": "$.PatchCommand",
+            "Next": "WaitForPatch"
+          },
+          "WaitForPatch": {
+            "Type": "Wait",
+            "Seconds": 120,
+            "Next": "CheckPatchStatus"
+          },
+          "CheckPatchStatus": {
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:ap-south-1:757443077630:function:CheckPatchStatusLambda",
+            "ResultPath": "$.PatchStatus",
+            "Next": "PatchSucceeded?"
+          },
+          "PatchSucceeded?": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.PatchStatus.status",
+                "StringEquals": "SUCCESS",
+                "Next": "RebootRequired?"
+              },
+              {
+                "Variable": "$.PatchStatus.status",
+                "StringEquals": "FAILED",
+                "Next": "RollbackInstance"
+              }
+            ],
+            "Default": "WaitForPatch"
+          },
+          "RebootRequired?": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.PatchStatus.rebootRequired",
+                "BooleanEquals": true,
+                "Next": "RebootInstance"
+              }
+            ],
+            "Default": "Success"
+          },
+          "RebootInstance": {
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:ap-south-1:757443077630:function:RebootInstanceLambda",
+            "Next": "Success"
+          },
+          "RollbackInstance": {
+            "Type": "Task",
+            "Resource": "arn:aws:lambda:ap-south-1:757443077630:function:RollbackInstanceLambda",
+            "Next": "Failure"
+          },
+          "Success": {
+            "Type": "Succeed"
+          },
+          "Failure": {
+            "Type": "Fail",
+            "Error": "PatchingFailed",
+            "Cause": "Patch failed and rollback executed"
+          }
+        }
+      },
+      "End": true
+    }
+  }
+}

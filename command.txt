@@ -1,0 +1,19 @@
+aws cloudformation deploy \
+  --stack-name ec2-patch-automation \
+  --template-file patch-automation.yaml \
+  --capabilities CAPABILITY_NAMED_IAM \
+  --parameter-overrides \
+    ScheduleExpression="cron(0 20 ? * SUN *)" \
+    InstanceIds="i-aaa,i-bbb,i-ccc" \
+    TakeSnapshotLambdaArn="arn:aws:lambda:ap-south-1:XXXX:function:TakeSnapshotLambda" \
+    CheckSnapshotStatusLambdaArn="arn:aws:lambda:ap-south-1:XXXX:function:CheckSnapshotStatusLambda" \
+    StartPatchingLambdaArn="arn:aws:lambda:ap-south-1:XXXX:function:StartPatchingLambda" \
+    CheckPatchStatusLambdaArn="arn:aws:lambda:ap-south-1:XXXX:function:CheckPatchStatusLambda" \
+    RebootInstanceLambdaArn="arn:aws:lambda:ap-south-1:XXXX:function:RebootInstanceLambda" \
+    RollbackInstanceLambdaArn="arn:aws:lambda:ap-south-1:XXXX:function:RollbackInstanceLambda"
+
+
+aws cloudformation deploy \
+  --stack-name ec2-patching-lambdas \
+  --template-file patching-lambdas.yaml \
+  --capabilities CAPABILITY_NAMED_IAM

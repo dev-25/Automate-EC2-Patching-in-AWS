@@ -1,0 +1,314 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Lambda functions for EC2 patch automation (snapshot, patch, reboot, rollback)
+
+#################################
+# IAM ROLE FOR ALL LAMBDAS
+#################################
+Resources:
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Tags:
+        - Key: Used for
+          Value: Automate patch
+
+  LambdaExecutionPolicy:
+    Type: AWS::IAM::RolePolicy
+    Properties:
+      PolicyName: LambdaExecutionPolicy
+      RoleName: !Ref LambdaExecutionRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - ec2:DescribeInstances
+              - ec2:DescribeVolumes
+              - ec2:CreateSnapshot
+              - ec2:DescribeSnapshots
+              - ec2:CreateVolume
+              - ec2:AttachVolume
+              - ec2:DetachVolume
+              - ec2:StopInstances
+              - ec2:StartInstances
+              - ec2:RebootInstances
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - ssm:SendCommand
+              - ssm:ListCommandInvocations
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: "*"
+
+#################################
+# 1. TAKE SNAPSHOT LAMBDA
+#################################
+  TakeSnapshotLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: TakeSnapshotLambda
+      Runtime: python3.10
+      Handler: index.lambda_handler
+      Timeout: 300
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Tags:
+        - Key: Used for
+          Value: Automate patch
+      Code:
+        ZipFile: |
+          import boto3
+          import time
+
+          ec2 = boto3.client('ec2')
+
+          def lambda_handler(event, context):
+              instance_id = event['InstanceId']
+
+              reservations = ec2.describe_instances(InstanceIds=[instance_id])['Reservations']
+              volumes = []
+
+              for r in reservations:
+                  for i in r['Instances']:
+                      for bd in i['BlockDeviceMappings']:
+                          volumes.append(bd['Ebs']['VolumeId'])
+
+              snapshot_ids = []
+
+              for vol in volumes:
+                  snap = ec2.create_snapshot(
+                      VolumeId=vol,
+                      Description=f"Pre-patch snapshot for {instance_id}"
+                  )
+                  snapshot_ids.append(snap['SnapshotId'])
+
+              return {
+                  "SnapshotIds": snapshot_ids
+              }
+
+#################################
+# 2. CHECK SNAPSHOT STATUS
+#################################
+  CheckSnapshotStatusLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CheckSnapshotStatusLambda
+      Runtime: python3.10
+      Handler: index.lambda_handler
+      Timeout: 120
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Tags:
+        - Key: Used for
+          Value: Automate patch
+      Code:
+        ZipFile: |
+          import boto3
+
+          ec2 = boto3.client('ec2')
+
+          def lambda_handler(event, context):
+              snapshot_ids = event['SnapshotResult']['SnapshotIds']
+
+              snapshots = ec2.describe_snapshots(
+                  SnapshotIds=snapshot_ids
+              )['Snapshots']
+
+              for snap in snapshots:
+                  if snap['State'] != 'completed':
+                      return {"status": "IN_PROGRESS"}
+
+              return {"status": "COMPLETED"}
+
+#################################
+# 3. START PATCHING
+#################################
+  StartPatchingLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: StartPatchingLambda
+      Runtime: python3.10
+      Handler: index.lambda_handler
+      Timeout: 120
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Tags:
+        - Key: Used for
+          Value: Automate patch
+      Code:
+        ZipFile: |
+          import boto3
+
+          ssm = boto3.client('ssm')
+
+          def lambda_handler(event, context):
+              instance_id = event['InstanceId']
+
+              response = ssm.send_command(
+                  InstanceIds=[instance_id],
+                  DocumentName="AWS-RunPatchBaseline",
+                  Parameters={
+                      "Operation": ["Install"],
+                      "RebootOption": ["RebootIfNeeded"]
+                  }
+              )
+
+              return {
+                  "CommandId": response['Command']['CommandId']
+              }
+
+#################################
+# 4. CHECK PATCH STATUS
+#################################
+  CheckPatchStatusLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: CheckPatchStatusLambda
+      Runtime: python3.10
+      Handler: index.lambda_handler
+      Timeout: 120
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Tags:
+        - Key: Used for
+          Value: Automate patch
+      Code:
+        ZipFile: |
+          import boto3
+
+          ssm = boto3.client('ssm')
+
+          def lambda_handler(event, context):
+              instance_id = event['InstanceId']
+              command_id = event['PatchCommand']['CommandId']
+
+              invocations = ssm.list_command_invocations(
+                  CommandId=command_id,
+                  InstanceId=instance_id,
+                  Details=True
+              )['CommandInvocations']
+
+              if not invocations:
+                  return {"status": "IN_PROGRESS"}
+
+              status = invocations[0]['Status']
+
+              if status in ['Pending', 'InProgress', 'Delayed']:
+                  return {"status": "IN_PROGRESS"}
+
+              if status == 'Success':
+                  reboot_required = False
+                  plugins = invocations[0]['CommandPlugins']
+                  for p in plugins:
+                      if 'Reboot is required' in (p.get('Output') or ''):
+                          reboot_required = True
+
+                  return {
+                      "status": "SUCCESS",
+                      "rebootRequired": reboot_required
+                  }
+
+              return {"status": "FAILED"}
+
+
+#################################
+# 5. REBOOT INSTANCE
+#################################
+  RebootInstanceLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: RebootInstanceLambda
+      Runtime: python3.10
+      Handler: index.lambda_handler
+      Timeout: 120
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Tags:
+        - Key: Used for
+          Value: Automate patch
+      Code:
+        ZipFile: |
+          import boto3
+          ec2 = boto3.client('ec2')
+          def lambda_handler(event, context):
+              instance_id = event['InstanceId']
+              ec2.reboot_instances(
+                  InstanceIds=[instance_id]
+              )
+              return {"reboot": "initiated"}
+
+#################################
+# 6. ROLLBACK INSTANCE
+#################################
+  RollbackInstanceLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: RollbackInstanceLambda
+      Runtime: python3.10
+      Handler: index.lambda_handler
+      Timeout: 900
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Tags:
+        - Key: Used for
+          Value: Automate patch
+      Code:
+        ZipFile: |
+          import boto3
+          import time
+
+          ec2 = boto3.client('ec2')
+
+          def lambda_handler(event, context):
+              instance_id = event['InstanceId']
+              snapshot_id = event['SnapshotResult']['SnapshotIds'][0]
+
+              # Stop instance
+              ec2.stop_instances(InstanceIds=[instance_id])
+              ec2.get_waiter('instance_stopped').wait(InstanceIds=[instance_id])
+
+              # Get root volume
+              reservations = ec2.describe_instances(InstanceIds=[instance_id])['Reservations']
+              instance = reservations[0]['Instances'][0]
+
+              root_device = instance['RootDeviceName']
+              root_volume_id = None
+              availability_zone = instance['Placement']['AvailabilityZone']
+
+              for bd in instance['BlockDeviceMappings']:
+                  if bd['DeviceName'] == root_device:
+                      root_volume_id = bd['Ebs']['VolumeId']
+
+              # Detach old volume
+              ec2.detach_volume(VolumeId=root_volume_id)
+              time.sleep(10)
+
+              # Create new volume from snapshot
+              new_vol = ec2.create_volume(
+                  SnapshotId=snapshot_id,
+                  AvailabilityZone=availability_zone
+              )
+
+              ec2.get_waiter('volume_available').wait(
+                  VolumeIds=[new_vol['VolumeId']]
+              )
+
+              # Attach new volume
+              ec2.attach_volume(
+                  VolumeId=new_vol['VolumeId'],
+                  InstanceId=instance_id,
+                  Device=root_device
+              )
+
+              # Start instance
+              ec2.start_instances(InstanceIds=[instance_id])
+
+              return {"rollback": "completed"}
+
